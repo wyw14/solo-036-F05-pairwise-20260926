@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wyw14/solo-036/internal/compressor"
 	"github.com/wyw14/solo-036/internal/emergency"
 	"github.com/wyw14/solo-036/internal/journal"
 	"github.com/wyw14/solo-036/internal/launcher"
@@ -37,7 +38,14 @@ type LaunchRequest struct {
 	StationID      string  `json:"station_id"`
 	RouteID        string  `json:"route_id"`
 	TargetPressure float64 `json:"target_pressure"`
+	// RampStep 是升压链每一拍的压力增量；RampIntervalMS 是相邻两拍的间隔毫秒。
+	// 留空时按默认斜率把目标压力分若干拍逼近。
+	RampStep       float64 `json:"ramp_step"`
+	RampIntervalMS int64   `json:"ramp_interval_ms"`
 }
+
+// defaultRampSteps 是未指定步长时，把目标压力分的默认拍数。
+const defaultRampSteps = 10
 
 type TrackingRequest struct {
 	StationID  string             `json:"station_id"`
@@ -57,6 +65,8 @@ type RecoveryReport struct {
 	RecoveredRoutes  int  `json:"recovered_routes"`
 	RecoveredPermits int  `json:"recovered_permits"`
 	JournalEvents    int  `json:"journal_events"`
+	InterruptedRamps int  `json:"interrupted_ramps"`
+	ReachedRamps     int  `json:"reached_ramps"`
 	Ready            bool `json:"ready"`
 }
 
@@ -196,6 +206,7 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 	if err := r.ValidateLaunchRequest(request); err != nil {
 		return model.OperationRecord{}, err
 	}
+	station := r.ensureControl().Stations[request.StationID]
 	created, err := r.CreateOperation(request.StationID)
 	if err != nil {
 		return model.OperationRecord{}, err
@@ -223,11 +234,29 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 		r.Routes.Release(request.RouteID, created.ID)
 		return model.OperationRecord{}, errors.New("launcher interlocks rejected current closure proof")
 	}
-	if err := r.Pressure.Apply(created.ID, request.TargetPressure); err != nil {
+	// 先进入“升压中”：到达目标前命令不得进入“已发射”。
+	if err := run.Pressurize(r.Runs, created.ID); err != nil {
+		r.Pressure.Stop()
 		r.Routes.Release(request.RouteID, created.ID)
 		return model.OperationRecord{}, err
 	}
-	if err := run.Start(r.Runs, created.ID); err != nil {
+	step := request.RampStep
+	if step <= 0 {
+		step = request.TargetPressure / defaultRampSteps
+	}
+	interval := compressor.DefaultStepInterval
+	if request.RampIntervalMS > 0 {
+		interval = time.Duration(request.RampIntervalMS) * time.Millisecond
+	}
+	// 不再一次写目标值：占用执行机构并启动按斜率逐步逼近的升压链。
+	plan := compressor.Plan{
+		RunID:    created.ID,
+		Target:   request.TargetPressure,
+		Step:     step,
+		Limit:    station.PressureLimit,
+		Interval: interval,
+	}
+	if _, err := r.Compressor.Start(r.rampCtx, plan); err != nil {
 		r.Pressure.Stop()
 		r.Routes.Release(request.RouteID, created.ID)
 		return model.OperationRecord{}, err
@@ -250,9 +279,9 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 	}
 	pressureState := control.Pressures[request.StationID]
 	pressureState.RunID = created.ID
-	pressureState.Value = request.TargetPressure
+	pressureState.Value = r.Pressure.Current()
 	pressureState.Target = request.TargetPressure
-	pressureState.Mode = model.CompressorHolding
+	pressureState.Mode = model.CompressorRamping
 	pressureState.ObservedAt = now
 	control.Pressures[request.StationID] = pressureState
 	valveState := control.Valves[request.StationID+"/main"]
@@ -270,14 +299,15 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 		Payload: request.RouteID,
 		At:      now,
 	}); err != nil {
+		// 日志落不了盘就不能让升压继续：中断升压链并等待留痕落定。
+		if done, running := r.Compressor.Cancel(created.ID); running {
+			<-done
+		}
+		r.Pressure.Stop()
+		r.Routes.Release(request.RouteID, created.ID)
 		return model.OperationRecord{}, err
 	}
-	select {
-	case <-ctx.Done():
-		_ = r.Cancel(created.ID)
-		return model.OperationRecord{}, ctx.Err()
-	default:
-	}
+	// 升压链已与本次 HTTP 请求解耦；这里不再因为请求结束而取消升压。
 	return r.Operation(created.ID)
 }
 
@@ -293,6 +323,10 @@ func (r *Runtime) Track(runID string, request TrackingRequest) (model.OperationR
 	current, ok := r.Runs.Get(runID)
 	if !ok {
 		return model.OperationRecord{}, fmt.Errorf("run %s not found", runID)
+	}
+	// 只有压力到达目标、清管器已发射后才接受跟踪；升压中或已中断的旧命令拒绝。
+	if current.State != model.StateLaunched && current.State != model.StateTracking {
+		return model.OperationRecord{}, fmt.Errorf("run state %s cannot accept tracking", current.State)
 	}
 	if current.State == model.StateLaunched {
 		if err := run.Track(r.Runs, runID); err != nil {
@@ -462,6 +496,14 @@ func (r *Runtime) Complete(runID, routeID string) (model.OperationRecord, error)
 }
 
 func (r *Runtime) Cancel(runID string) error {
+	if _, ok := r.Runs.Get(runID); !ok {
+		return fmt.Errorf("run %s not found", runID)
+	}
+	// 先请求升压链中断，并等待它把“实际达到的压力 + 停机原因”落定，
+	// 避免取消返回后现场仍看到旧命令在继续升压。
+	if done, running := r.Compressor.Cancel(runID); running {
+		<-done
+	}
 	if err := r.Runs.Cancel(runID); err != nil {
 		return err
 	}
@@ -475,6 +517,13 @@ func (r *Runtime) Cancel(runID string) error {
 			routeState.LeaseEpoch = 0
 			routeState.UpdatedAt = time.Now().UTC()
 			r.control.Routes[id] = routeState
+		}
+	}
+	for stationID, state := range r.control.Pressures {
+		if state.RunID == runID {
+			state.Mode = model.CompressorStopped
+			state.ObservedAt = time.Now().UTC()
+			r.control.Pressures[stationID] = state
 		}
 	}
 	r.control.Revision = model.NewRevision()
@@ -492,6 +541,8 @@ func (r *Runtime) Operation(runID string) (model.OperationRecord, error) {
 	if !ok {
 		return model.OperationRecord{}, fmt.Errorf("run %s not found", runID)
 	}
+	ramp := r.buildRamp(operation.Run, operation.Pressure)
+	operation.Ramp = &ramp
 	return operation, nil
 }
 
@@ -623,11 +674,15 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	if err != nil {
 		return RecoveryReport{}, err
 	}
+	// 重启恢复后对账：途中的升压一律落定为关停中断，杜绝旧命令继续。
+	interruptedRamps, reachedRamps := r.reconcileRampsAfterRecovery(snapshot.Control.Pressures)
 	return RecoveryReport{
 		RecoveredRuns:    len(snapshot.Control.Runs),
 		RecoveredRoutes:  len(leasing),
 		RecoveredPermits: len(permitEvents),
 		JournalEvents:    len(events),
+		InterruptedRamps: interruptedRamps,
+		ReachedRamps:     reachedRamps,
 		Ready:            true,
 	}, nil
 }

@@ -24,6 +24,8 @@ type createRequest struct {
 	StationID      string  `json:"station_id"`
 	RouteID        string  `json:"route_id"`
 	TargetPressure float64 `json:"target_pressure"`
+	RampStep       float64 `json:"ramp_step"`
+	RampIntervalMS int64   `json:"ramp_interval_ms"`
 }
 
 type trackRequest struct {
@@ -97,6 +99,8 @@ func (h *Handler) Launch(w http.ResponseWriter, r *http.Request) {
 		StationID:      request.StationID,
 		RouteID:        request.RouteID,
 		TargetPressure: request.TargetPressure,
+		RampStep:       request.RampStep,
+		RampIntervalMS: request.RampIntervalMS,
 	})
 	if err != nil {
 		writeError(w, r, http.StatusConflict, err)

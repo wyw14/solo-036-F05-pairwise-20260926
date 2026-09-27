@@ -102,6 +102,7 @@ type OperationRecord struct {
 	Run       Run             `json:"run"`
 	Route     RouteState      `json:"route"`
 	Pressure  PressureState   `json:"pressure"`
+	Ramp      *RampStatus     `json:"ramp,omitempty"`
 	Tracking  []TrackingState `json:"tracking"`
 	Permits   []PermitState   `json:"permits"`
 	LastError string          `json:"last_error,omitempty"`
