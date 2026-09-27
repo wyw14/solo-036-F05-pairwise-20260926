@@ -37,6 +37,11 @@ type LaunchRequest struct {
 	StationID      string  `json:"station_id"`
 	RouteID        string  `json:"route_id"`
 	TargetPressure float64 `json:"target_pressure"`
+	// RampStep is the pressure added per tick (the slope magnitude). When zero,
+	// the target is approached in twelve equal steps.
+	RampStep float64 `json:"ramp_step,omitempty"`
+	// RampInterval is the time between ramp ticks. Defaults to 200ms.
+	RampInterval time.Duration `json:"ramp_interval,omitempty"`
 }
 
 type TrackingRequest struct {
@@ -192,7 +197,7 @@ func (r *Runtime) ValidateLaunchRequest(request LaunchRequest) error {
 	return nil
 }
 
-func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.OperationRecord, error) {
+func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (record model.OperationRecord, err error) {
 	if err := r.ValidateLaunchRequest(request); err != nil {
 		return model.OperationRecord{}, err
 	}
@@ -200,6 +205,16 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 	if err != nil {
 		return model.OperationRecord{}, err
 	}
+	if !r.claimCompressor(created.ID) {
+		_ = r.Runs.Cancel(created.ID)
+		return model.OperationRecord{}, errors.New("compressor is already ramping another run")
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			r.releaseCompressor(created.ID)
+		}
+	}()
 	lease, routeErr := r.Routes.Reserve(request.RouteID, created.ID, created.Epoch)
 	if routeErr != nil {
 		r.recordIncident(created.ID, "warning", routeErr.Error())
@@ -223,16 +238,13 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 		r.Routes.Release(request.RouteID, created.ID)
 		return model.OperationRecord{}, errors.New("launcher interlocks rejected current closure proof")
 	}
-	if err := r.Pressure.Apply(created.ID, request.TargetPressure); err != nil {
-		r.Routes.Release(request.RouteID, created.ID)
-		return model.OperationRecord{}, err
-	}
 	if err := run.Start(r.Runs, created.ID); err != nil {
 		r.Pressure.Stop()
 		r.Routes.Release(request.RouteID, created.ID)
 		return model.OperationRecord{}, err
 	}
 	now := time.Now().UTC()
+	station := r.control.Stations[request.StationID]
 	r.mu.Lock()
 	control := r.control
 	routeState := control.Routes[request.RouteID]
@@ -250,9 +262,11 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 	}
 	pressureState := control.Pressures[request.StationID]
 	pressureState.RunID = created.ID
-	pressureState.Value = request.TargetPressure
+	pressureState.Value = r.Pressure.Current()
 	pressureState.Target = request.TargetPressure
-	pressureState.Mode = model.CompressorHolding
+	pressureState.ReachedPressure = 0
+	pressureState.StopReason = ""
+	pressureState.Mode = model.CompressorRamping
 	pressureState.ObservedAt = now
 	control.Pressures[request.StationID] = pressureState
 	valveState := control.Valves[request.StationID+"/main"]
@@ -265,9 +279,9 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 	r.mu.Unlock()
 	if err := r.appendEvent(model.Event{
 		RunID:   created.ID,
-		Kind:    "launch",
+		Kind:    "pressurization_started",
 		Epoch:   closureEpoch,
-		Payload: request.RouteID,
+		Payload: fmt.Sprintf("%s/target=%.3f", request.RouteID, request.TargetPressure),
 		At:      now,
 	}); err != nil {
 		return model.OperationRecord{}, err
@@ -278,6 +292,8 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 		return model.OperationRecord{}, ctx.Err()
 	default:
 	}
+	r.startRamp(created.ID, request.TargetPressure, station.PressureLimit, request.RampStep, request.RampInterval)
+	committed = true
 	return r.Operation(created.ID)
 }
 
@@ -462,6 +478,9 @@ func (r *Runtime) Complete(runID, routeID string) (model.OperationRecord, error)
 }
 
 func (r *Runtime) Cancel(runID string) error {
+	// Signal the ramp first so it wakes immediately and records its final
+	// reached pressure and reason before the controller is deauthorized.
+	r.cancelRamp(runID)
 	if err := r.Runs.Cancel(runID); err != nil {
 		return err
 	}
@@ -619,6 +638,7 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	r.control.Incidents = append([]model.Incident(nil), snapshot.Control.Incidents...)
 	r.control.Revision = model.NewRevision()
 	r.mu.Unlock()
+	r.reconcileOrphanedRamps(snapshot.Control)
 	events, err := control.Persistent.Events()
 	if err != nil {
 		return RecoveryReport{}, err

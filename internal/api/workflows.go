@@ -24,6 +24,10 @@ type createRequest struct {
 	StationID      string  `json:"station_id"`
 	RouteID        string  `json:"route_id"`
 	TargetPressure float64 `json:"target_pressure"`
+	// RampStep is the pressure increment per tick; zero selects twelve equal steps.
+	RampStep float64 `json:"ramp_step"`
+	// RampIntervalMS is the time between ramp ticks in milliseconds; zero uses the default.
+	RampIntervalMS int64 `json:"ramp_interval_ms"`
 }
 
 type trackRequest struct {
@@ -93,10 +97,16 @@ func (h *Handler) Launch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, err)
 		return
 	}
+	var rampInterval time.Duration
+	if request.RampIntervalMS > 0 {
+		rampInterval = time.Duration(request.RampIntervalMS) * time.Millisecond
+	}
 	operation, err := h.runtime.Launch(r.Context(), service.LaunchRequest{
 		StationID:      request.StationID,
 		RouteID:        request.RouteID,
 		TargetPressure: request.TargetPressure,
+		RampStep:       request.RampStep,
+		RampInterval:   rampInterval,
 	})
 	if err != nil {
 		writeError(w, r, http.StatusConflict, err)

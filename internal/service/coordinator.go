@@ -1,6 +1,9 @@
 package service
 
 import (
+	"context"
+	"sync"
+
 	"github.com/wyw14/solo-036/internal/compressor"
 	"github.com/wyw14/solo-036/internal/journal"
 	"github.com/wyw14/solo-036/internal/launcher"
@@ -11,7 +14,6 @@ import (
 	"github.com/wyw14/solo-036/internal/run"
 	"github.com/wyw14/solo-036/internal/tracker"
 	"github.com/wyw14/solo-036/internal/valve"
-	"sync"
 )
 
 type Runtime struct {
@@ -28,6 +30,7 @@ type Runtime struct {
 	Compressor *compressor.Worker
 	mu         sync.Mutex
 	control    *ControlState
+	ramps      map[string]context.CancelFunc
 }
 
 func NewRuntime() *Runtime {
@@ -42,5 +45,22 @@ func NewRuntime() *Runtime {
 	valves := valve.NewController(p)
 	recv := receiver.NewController()
 	worker := compressor.NewWorker(p, runs)
-	return &Runtime{Runs: runs, Routes: routes, Tracker: tracks, Lineage: lineage, Journal: journalStore, Pressure: p, Permits: permits, Launcher: launch, Valves: valves, Receiver: recv, Compressor: worker, control: defaultControlState()}
+	runtime := &Runtime{
+		Runs:       runs,
+		Routes:     routes,
+		Tracker:    tracks,
+		Lineage:    lineage,
+		Journal:    journalStore,
+		Pressure:   p,
+		Permits:    permits,
+		Launcher:   launch,
+		Valves:     valves,
+		Receiver:   recv,
+		Compressor: worker,
+		control:    defaultControlState(),
+		ramps:      make(map[string]context.CancelFunc),
+	}
+	// Field progress and the terminal report are driven by the ramp worker.
+	worker.OnProgress(runtime.rampProgress).OnFinished(runtime.rampFinished)
+	return runtime
 }

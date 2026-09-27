@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+
 	"github.com/wyw14/solo-036/internal/compressor"
 	"github.com/wyw14/solo-036/internal/emergency"
 	"github.com/wyw14/solo-036/internal/journal"
@@ -19,4 +20,13 @@ func (r *Runtime) Bootstrap() {
 	_ = compressor.Healthy(r.Compressor)
 	_ = emergency.Safe(r.Pressure)
 }
-func (r *Runtime) Shutdown(ctx context.Context) error { r.Pressure.Stop(); return ctx.Err() }
+
+// Shutdown aborts every in-flight ramp and waits for it to leave its terminal
+// report before deauthorizing pressure. Each interrupted ramp records the
+// pressure it actually reached and a cancellation reason.
+func (r *Runtime) Shutdown(ctx context.Context) error {
+	r.cancelAllRamps()
+	_ = r.Compressor.Wait(ctx)
+	r.Pressure.Stop()
+	return ctx.Err()
+}

@@ -61,12 +61,14 @@ type ClosureState struct {
 }
 
 type PressureState struct {
-	StationID  string         `json:"station_id"`
-	RunID      string         `json:"run_id,omitempty"`
-	Value      float64        `json:"value"`
-	Target     float64        `json:"target"`
-	Mode       CompressorMode `json:"mode"`
-	ObservedAt time.Time      `json:"observed_at"`
+	StationID       string         `json:"station_id"`
+	RunID           string         `json:"run_id,omitempty"`
+	Value           float64        `json:"value"`
+	Target          float64        `json:"target"`
+	Mode            CompressorMode `json:"mode"`
+	ReachedPressure float64        `json:"reached_pressure,omitempty"`
+	StopReason      string         `json:"stop_reason,omitempty"`
+	ObservedAt      time.Time      `json:"observed_at"`
 }
 
 type RouteState struct {
